@@ -7,6 +7,7 @@ from typing import Any, TypeVar
 from pydantic import BaseModel
 
 from .anthropic_provider import AnthropicProvider
+from .bedrock_provider import BedrockProvider
 from .deepseek_provider import DeepSeekProvider
 from .gemini_provider import GeminiProvider
 from .mock_provider import MockProvider
@@ -116,6 +117,12 @@ class UnifiedLLMClient:
             self.provider = XAIProvider(
                 **common_kwargs,
                 verbose=llm_verbose
+            )
+        elif provider_name == "bedrock":
+            self.provider = BedrockProvider(
+                **common_kwargs,
+                verbose=llm_verbose,
+                thinking_enabled=model_config.get("thinking_enabled", False)
             )
         elif provider_name == "deepseek":
             self.provider = DeepSeekProvider(

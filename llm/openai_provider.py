@@ -64,10 +64,13 @@ class OpenAIProvider(BaseLLMProvider):
                 print(f"[OpenAI Provider] Using base_url: {base_url}")
             except Exception:
                 pass
-        # Prefer Responses API for GPT-5 family unless overridden
+        # Prefer Responses API for GPT-5 family unless overridden.
+        # Also honour config-level openai.use_responses and per-model use_responses flags.
         mdl = (self.model_name or "").lower()
         env_force_resp = os.environ.get("HOUND_OPENAI_USE_RESPONSES", "").lower() in {"1","true","yes","on"}
-        self.use_responses = bool(env_force_resp or mdl.startswith("gpt-5"))
+        cfg_force_resp = config.get("openai", {}).get("use_responses", False) if isinstance(config, dict) else False
+        self.use_responses = bool(env_force_resp or cfg_force_resp or mdl.startswith("gpt-5"))
+        self._beta_parse_unsupported = False
     
     def parse(self, *, system: str, user: str, schema: type[T], reasoning_effort: str | None = None) -> T:
         """Make a structured call. Uses Responses API for GPT-5; otherwise Chat Completions parse."""
@@ -153,26 +156,7 @@ class OpenAIProvider(BaseLLMProvider):
                         raise RuntimeError("No output_text in response")
                     return schema.model_validate_json(output_text)
                 else:
-                    # Chat Completions structured output path
-                    completion = self.client.beta.chat.completions.parse(
-                        model=self.model_name,
-                        messages=messages,
-                        response_format=schema,
-                        timeout=self.timeout
-                    )
-                    if hasattr(completion, 'usage') and completion.usage:
-                        self._last_token_usage = {
-                            'input_tokens': completion.usage.prompt_tokens or 0,
-                            'output_tokens': completion.usage.completion_tokens or 0,
-                            'total_tokens': completion.usage.total_tokens or 0
-                        }
-                    if completion.choices[0].message.parsed:
-                        return completion.choices[0].message.parsed
-                    elif completion.choices[0].message.refusal:
-                        raise RuntimeError(f"Model refused: {completion.choices[0].message.refusal}")
-                    else:
-                        json_str = completion.choices[0].message.content
-                        return schema.model_validate_json(json_str)
+                    return self._parse_chat(messages, schema)
                     
             except Exception as e:
                 last_err = e
@@ -186,6 +170,74 @@ class OpenAIProvider(BaseLLMProvider):
         
         raise RuntimeError(f"OpenAI call failed after {self.retries} attempts: {last_err}")
     
+    def _parse_chat(self, messages: list[dict], schema: type[T]) -> T:
+        """Chat Completions structured output with automatic fallback.
+
+        Tries beta.chat.completions.parse first.  If the endpoint returns 404
+        (common on proxy/gateway servers that don't support the beta parse
+        path), falls back to a plain chat.completions.create call with the
+        JSON schema embedded in the system prompt, then validates locally.
+        """
+        from openai import NotFoundError
+        import json as _json
+
+        if not self._beta_parse_unsupported:
+            try:
+                completion = self.client.beta.chat.completions.parse(
+                    model=self.model_name,
+                    messages=messages,
+                    response_format=schema,
+                    timeout=self.timeout
+                )
+                if hasattr(completion, 'usage') and completion.usage:
+                    self._last_token_usage = {
+                        'input_tokens': completion.usage.prompt_tokens or 0,
+                        'output_tokens': completion.usage.completion_tokens or 0,
+                        'total_tokens': completion.usage.total_tokens or 0
+                    }
+                if completion.choices[0].message.parsed:
+                    return completion.choices[0].message.parsed
+                elif completion.choices[0].message.refusal:
+                    raise RuntimeError(f"Model refused: {completion.choices[0].message.refusal}")
+                else:
+                    json_str = completion.choices[0].message.content
+                    return schema.model_validate_json(json_str)
+            except NotFoundError:
+                self._beta_parse_unsupported = True
+                if self.verbose:
+                    print("  beta.chat.completions.parse returned 404; falling back to plain completions")
+
+        try:
+            json_schema = schema.model_json_schema()
+        except Exception:
+            try:
+                json_schema = schema.schema()
+            except Exception:
+                json_schema = None
+        schema_hint = ""
+        if isinstance(json_schema, dict):
+            schema_hint = "\nFollow this JSON schema exactly (no extra keys, all required):\n" + _json.dumps(json_schema)
+        strict_instr = "\nReturn ONLY valid JSON. No markdown. No prose."
+
+        fallback_messages = list(messages)
+        fallback_messages[0] = {
+            "role": "system",
+            "content": fallback_messages[0]["content"] + schema_hint + strict_instr,
+        }
+        completion = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=fallback_messages,
+            timeout=self.timeout,
+        )
+        if hasattr(completion, 'usage') and completion.usage:
+            self._last_token_usage = {
+                'input_tokens': completion.usage.prompt_tokens or 0,
+                'output_tokens': completion.usage.completion_tokens or 0,
+                'total_tokens': completion.usage.total_tokens or 0
+            }
+        raw_text = completion.choices[0].message.content
+        return schema.model_validate_json(raw_text)
+
     def raw(self, *, system: str, user: str, reasoning_effort: str | None = None) -> str:
         """Make a plain text call."""
         messages = [
